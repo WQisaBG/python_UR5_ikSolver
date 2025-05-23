@@ -285,15 +285,63 @@ class InverseKinematicsUR5:
         return weight_pos * np.linalg.norm(pos_error) + weight_orient * np.linalg.norm(orient_error)
 
     # 使用 Scipy 进行非线性优化的数值解法
+    def computeJacobian(self, theta: np.ndarray, delta: float = 1e-6) -> np.ndarray:
+        J = np.zeros((6, 6))
+        for i in range(6):
+            theta_plus = theta.copy()
+            theta_minus = theta.copy()
+            theta_plus[i] += delta
+            theta_minus[i] -= delta
+
+            T_plus = self.fk(theta_plus)
+            T_minus = self.fk(theta_minus)
+
+            dT = T_plus @ invTransform(T_minus)
+            J[:, i] = [
+                dT[0, 3], dT[1, 3], dT[2, 3],
+                math.atan2(dT[2, 1], dT[2, 2]),  # x-axis rotation
+                math.atan2(-dT[2, 0], math.hypot(dT[2, 1], dT[2, 2])),  # y-axis
+                math.atan2(dT[1, 0], dT[0, 0])   # z-axis
+            ]
+        return J / (2 * delta)
+
+    def isSingular(self, theta: np.ndarray, threshold: float = 1e-3) -> bool:
+        J = self.computeJacobian(theta)
+        _, S, _ = np.linalg.svd(J)
+        if self.debug:
+            print(f"最小奇异值: {np.min(S)}")
+        return np.min(S) < threshold
+
+    def isPoseReachable(self, target_pose: np.ndarray, num_samples: int = 50, threshold: float = 1e-3) -> bool:
+        for _ in range(num_samples):
+            x0 = np.random.uniform(self.limit_min, self.limit_max, size=6)
+            result = minimize(
+                fun=lambda x: self.objective_func(x, target_pose),
+                x0=x0,
+                method='L-BFGS-B',
+                bounds=[(self.limit_min, self.limit_max)] * 6,
+                tol=1e-5,
+                options={'maxiter': 100, 'disp': False}
+            )
+            if result.success and np.linalg.norm(result.fun) < 0.01:
+                return True
+        return False
+
     def solveIKNumerical_Scipy(
         self,
         forward_kinematics: np.ndarray,
         current_joint_angles: List[float],
         max_iter: int = 1000,
-        tol: float = 1e-6
+        tol: float = 1e-6,
+        singular_threshold: float = 1e-3
     ) -> Optional[np.ndarray]:
         x0 = np.array(current_joint_angles).copy()
         bounds = [(self.limit_min, self.limit_max) for _ in range(6)]
+
+        # 检查初始构型是否奇异
+        if self.isSingular(x0, threshold=singular_threshold):
+            print("❌ 初始构型处于奇异状态，可能导致不可达")
+            return None
 
         result = minimize(
             fun=lambda x: self.objective_func(x, forward_kinematics),
@@ -304,9 +352,15 @@ class InverseKinematicsUR5:
             options={'maxiter': max_iter, 'disp': False}
         )
 
+        final_theta = result.x
+        # 检查最终构型是否奇异
+        if self.isSingular(final_theta, threshold=singular_threshold):
+            print("❌ 最终构型处于奇异状态，结果可能不稳定")
+            return None
+
         if result.success:
             print(f"✅ 成功收敛于 {result.nit} 次迭代")
-            return result.x
+            return final_theta
         else:
             print("⚠️ 未成功收敛")
             print("最终误差:", result.fun)
@@ -314,6 +368,10 @@ class InverseKinematicsUR5:
 
     # 找到最接近当前构型的 IK 解
     def findClosestIK(self, forward_kinematics: np.ndarray, current_joint_configuration: List[float], use_numerical: bool = False) -> Optional[np.ndarray]:
+        if not self.isPoseReachable(forward_kinematics, num_samples=50):
+            print("❌ 目标位姿不可达")
+            return None
+
         if use_numerical:
             return self.solveIKNumerical_Scipy(forward_kinematics, current_joint_configuration)
         else:

@@ -14,5 +14,5 @@ theta_sol_scipy = ik.findClosestIK(gd, [0.6, 0.2, 0.5, 1.2, 0.1, -0.1], use_nume
 print("Scipy Numerical Solution:", theta_sol_scipy)
 
 # （可选）使用解析解
-theta_sol_analytical = ik.findClosestIK(gd, [0.6, 0.2, 0.5, 1.2, 0.1, -0.1], use_numerical=False)
-print("Analytical Solution:", theta_sol_analytical)
+# theta_sol_analytical = ik.findClosestIK(gd, [0.6, 0.2, 0.5, 1.2, 0.1, -0.1], use_numerical=False)
+# print("Analytical Solution:", theta_sol_analytical)
