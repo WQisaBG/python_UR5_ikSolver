@@ -3,6 +3,10 @@ import numpy as np
 from typing import List, Optional, Tuple, Union
 from scipy.spatial.transform import Rotation as R
 from scipy.optimize import minimize
+import matplotlib.pyplot as plt
+import time
+from scipy.signal import savgol_filter
+
 
 def invTransform(Transform: np.ndarray) -> np.ndarray:
     T = np.matrix(Transform)
@@ -13,6 +17,7 @@ def invTransform(Transform: np.ndarray) -> np.ndarray:
     inverseT = np.vstack((inverseT, [0, 0, 0, 1]))
     return np.asarray(inverseT)
 
+
 # D-H变换矩阵
 def transformDHParameter(a: float, d: float, alpha: float, theta: float) -> np.ndarray:
     T = np.array([
@@ -22,6 +27,7 @@ def transformDHParameter(a: float, d: float, alpha: float, theta: float) -> np.n
         [0, 0, 0, 1]
     ])
     return T
+
 
 # 前向运动学函数
 def transformRobotParameter(theta: List[float]) -> np.ndarray:
@@ -38,6 +44,10 @@ class InverseKinematicsUR5:
     def __init__(self):
         # Debug mode
         self.debug: bool = False
+
+        self.perturb_if_singular: bool = True
+        self.perturb_amount: float = 0.05
+        self.previous_theta: Optional[np.ndarray] = None  # 上一次计算得到的theta
 
         # DH parameters
         self.d: List[float] = [0.089159, 0, 0, 0.10915, 0.09465, 0.0823]
@@ -74,6 +84,10 @@ class InverseKinematicsUR5:
         self.flags3: Optional[np.ndarray] = None
 
         self.theta4: np.ndarray = np.zeros((2, 2, 2))
+
+        # 缓存
+        self.pose_cache = {}
+        self._connectivity_cache = {}
 
     def enableDebugMode(self, debug: bool = True) -> None:
         self.debug = debug
@@ -275,16 +289,26 @@ class InverseKinematicsUR5:
     def fk(self, theta: List[float]) -> np.ndarray:
         return transformRobotParameter(theta)
 
-    # 优化目标函数：位置 + 姿态误差
-    def objective_func(self, theta: np.ndarray, target_pose: np.ndarray) -> float:
+    # 优化目标函数
+    def objective_func(self, theta: np.ndarray, target_pose: np.ndarray, previous_theta: Optional[np.ndarray] = None) -> float:
         T = self.fk(theta)
         pos_error = T[:3, 3] - target_pose[:3, 3]
         orient_error = R.from_matrix(T[:3, :3]).as_rotvec() - R.from_matrix(target_pose[:3, :3]).as_rotvec()
+
         weight_pos = 1.0
         weight_orient = 0.5
-        return weight_pos * np.linalg.norm(pos_error) + weight_orient * np.linalg.norm(orient_error)
+        weight_smooth = 0.1
 
-    # 使用 Scipy 进行非线性优化的数值解法
+        error = (
+            weight_pos * np.linalg.norm(pos_error) +
+            weight_orient * np.linalg.norm(orient_error)
+        )
+
+        if previous_theta is not None:
+            error += weight_smooth * np.linalg.norm(theta - previous_theta)
+
+        return error
+
     def computeJacobian(self, theta: np.ndarray, delta: float = 1e-6) -> np.ndarray:
         J = np.zeros((6, 6))
         for i in range(6):
@@ -313,6 +337,10 @@ class InverseKinematicsUR5:
         return np.min(S) < threshold
 
     def isPoseReachable(self, target_pose: np.ndarray, num_samples: int = 50, threshold: float = 1e-3) -> bool:
+        cache_key = tuple(target_pose.flatten().round(4))
+        if hasattr(self, 'pose_cache') and cache_key in self.pose_cache:
+            return self.pose_cache[cache_key]
+
         for _ in range(num_samples):
             x0 = np.random.uniform(self.limit_min, self.limit_max, size=6)
             result = minimize(
@@ -324,7 +352,14 @@ class InverseKinematicsUR5:
                 options={'maxiter': 100, 'disp': False}
             )
             if result.success and np.linalg.norm(result.fun) < 0.01:
+                if not hasattr(self, 'pose_cache'):
+                    self.pose_cache = {}
+                self.pose_cache[cache_key] = True
                 return True
+
+        if not hasattr(self, 'pose_cache'):
+            self.pose_cache = {}
+        self.pose_cache[cache_key] = False
         return False
 
     def solveIKNumerical_Scipy(
@@ -333,12 +368,12 @@ class InverseKinematicsUR5:
         current_joint_angles: List[float],
         max_iter: int = 1000,
         tol: float = 1e-6,
-        singular_threshold: float = 1e-3
+        singular_threshold: float = 1e-6
     ) -> Optional[np.ndarray]:
         x0 = np.array(current_joint_angles).copy()
-        bounds = [(self.limit_min, self.limit_max) for _ in range(6)]
+        bounds = [(self.limit_min, self.limit_max)] * 6
+        self.previous_theta = x0
 
-        # 检查初始构型是否奇异
         if self.isSingular(x0, threshold=singular_threshold):
             print("❌ 初始构型处于奇异状态，可能导致不可达")
             return None
@@ -353,39 +388,319 @@ class InverseKinematicsUR5:
         )
 
         final_theta = result.x
-        # 检查最终构型是否奇异
         if self.isSingular(final_theta, threshold=singular_threshold):
             print("❌ 最终构型处于奇异状态，结果可能不稳定")
             return None
 
         if result.success:
             print(f"✅ 成功收敛于 {result.nit} 次迭代")
+            self.previous_theta = final_theta.copy()
             return final_theta
         else:
             print("⚠️ 未成功收敛")
             print("最终误差:", result.fun)
             return None
 
-    # 找到最接近当前构型的 IK 解
     def findClosestIK(self, forward_kinematics: np.ndarray, current_joint_configuration: List[float], use_numerical: bool = False) -> Optional[np.ndarray]:
-        if not self.isPoseReachable(forward_kinematics, num_samples=50):
+        if not self.isPoseReachable(forward_kinematics):
             print("❌ 目标位姿不可达")
             return None
 
         if use_numerical:
-            return self.solveIKNumerical_Scipy(forward_kinematics, current_joint_configuration)
+            Q_analytical = self.solveIK(forward_kinematics)
+            if Q_analytical is not None:
+                current_joint = np.array(current_joint_configuration)
+                delta_Q = np.absolute(Q_analytical - current_joint) * self.joint_weights
+                closest_idx = np.argmin(np.sum(delta_Q, axis=1))
+                analytical_theta = Q_analytical[closest_idx]
+                numerical_result = self.solveIKNumerical_Scipy(forward_kinematics, analytical_theta.tolist())
+                if numerical_result is None and self.perturb_if_singular:
+                    print("🔄 尝试加入扰动重新求解")
+                    perturbed = [x + np.random.uniform(-self.perturb_amount, self.perturb_amount) for x in analytical_theta.tolist()]
+                    numerical_result = self.solveIKNumerical_Scipy(forward_kinematics, perturbed)
+                return numerical_result
+            else:
+                return self.solveIKNumerical_Scipy(forward_kinematics, current_joint_configuration)
+
         else:
             Q = self.solveIK(forward_kinematics)
             if Q is not None:
                 current_joint = np.array(current_joint_configuration)
                 delta_Q = np.absolute(Q - current_joint) * self.joint_weights
-                delta_Q_weights = np.sum(delta_Q, axis=1)
-                closest_ik_index = np.argmin(delta_Q_weights)
-
-                if self.debug:
-                    print(f'delta_Q weights for each solutions: {delta_Q_weights}')
-                    print(f'Closest IK solution: {Q[closest_ik_index,:]}')
-
-                return Q[closest_ik_index, :]
+                closest_ik_index = np.argmin(np.sum(delta_Q, axis=1))
+                return Q[closest_ik_index]
             else:
                 return None
+
+    def interpolatePose(self, start: np.ndarray, end: np.ndarray, steps: int = 100) -> List[np.ndarray]:
+        trajectory = []
+        for i in range(steps):
+            alpha = i / max((steps - 1), 1)
+            pos = (1 - alpha) * start[:3, 3] + alpha * end[:3, 3]
+            quat_start = R.from_matrix(start[:3, :3]).as_quat()
+            quat_end = R.from_matrix(end[:3, :3]).as_quat()
+            quat = (1 - alpha) * quat_start + alpha * quat_end
+            quat /= np.linalg.norm(quat)
+            rot = R.from_quat(quat).as_matrix()
+
+            T = np.eye(4)
+            T[:3, :3] = rot
+            T[:3, 3] = pos
+            trajectory.append(T)
+        return trajectory
+
+    def smoothTrajectory(self, trajectory: List[List[float]], window_size: int = 11, polyorder: int = 3) -> List[List[float]]:
+        if window_size % 2 == 0:
+            window_size += 1
+        traj_array = np.array(trajectory).T
+        smoothed = np.zeros_like(traj_array)
+
+        for i in range(6):
+            joint_data = traj_array[i]
+            if len(joint_data) < window_size:
+                smoothed[i] = joint_data
+            else:
+                smoothed[i] = savgol_filter(joint_data, window_size, polyorder)
+        return smoothed.T.tolist()
+
+    def planPath_RRT(
+        self,
+        waypoints: List[np.ndarray],
+        max_iter: int = 2000,
+        goal_sample_rate: float = 0.2,
+        search_radius: float = 0.3,
+        joint_bounds: Optional[List[Tuple[float, float]]] = None,
+        start_config: Optional[List[float]] = None,
+        smooth: bool = True,
+        show_animation: bool = False
+    ) -> List[List[float]]:
+        if not waypoints:
+            print("❌ 无目标位姿")
+            return []
+
+        if joint_bounds is None:
+            joint_bounds = [[self.limit_min, self.limit_max] for _ in range(6)]
+
+        path = []
+        current_start_config = start_config or [math.radians(angle) for angle in [0, -90, 0, -90, 0, 0]]
+
+        for target_pose in waypoints:
+            print(f"🎯 规划到目标位姿:\n{target_pose}")
+            rrt_result = self._rrt_search(target_pose, current_start_config, joint_bounds, max_iter, goal_sample_rate, search_radius, show_animation)
+            if rrt_result is None:
+                print("❌ 无法找到路径")
+                return []
+            path_segment, current_start_config = rrt_result
+            path.extend(path_segment)
+
+        if smooth and len(path) > 0:
+            print("🌀 平滑轨迹...")
+            path = self.smoothTrajectory(path)
+
+        return path
+
+    def _rrt_search(self, target_pose, start_config, joint_bounds, max_iter, goal_sample_rate, search_radius, animation=False):
+        from collections import defaultdict
+        import random
+
+        class Node:
+            def __init__(self, q):
+                self.q = np.array(q)
+                self.parent = None
+                self.cost = 0.0
+
+        nodes = [Node(start_config)]
+        best_goal_node = None
+        c_best = float('inf')
+        start_time = time.time()
+        timeout = 10
+        no_improvement = 0
+        MAX_NO_IMPROVEMENT = 200
+
+        x_center = np.array(start_config)
+        goal_config = self.findClosestIK(target_pose, start_config)
+        if goal_config is None:
+            print("❌ 目标构型不可达")
+            return None
+        goal_config = np.array(goal_config)
+        c_min = np.linalg.norm(goal_config - x_center)
+        L = np.eye(6)
+
+        for i in range(max_iter):
+            if time.time() - start_time > timeout:
+                print("⏰ 超时退出")
+                break
+
+            if random.random() < goal_sample_rate:
+                rnd = goal_config.copy()
+            else:
+                if c_best == float('inf'):
+                    # 使用 Halton 采样代替随机采样
+                    h_sample = self._halton_sequence(i, len(joint_bounds))
+                    rnd = []
+                    for j, (lb, ub) in enumerate(joint_bounds):
+                        rnd.append(lb + h_sample[j] * (ub - lb))
+                    rnd = np.array(rnd)
+                else:
+                    while True:
+                        rnd_ellipsoid = self._sample_in_ellipsoid(x_center, c_best, c_min, L, joint_bounds)
+                        T = self.fk(rnd_ellipsoid)
+                        if self.isPoseReachable(T):
+                            break
+                    rnd = rnd_ellipsoid
+
+            nearest_ind = min(range(len(nodes)), key=lambda i: np.linalg.norm(nodes[i].q - rnd))
+            nearest_node = nodes[nearest_ind]
+
+            dir_vec = rnd - nearest_node.q
+            length = np.linalg.norm(dir_vec)
+            if length == 0:
+                continue
+            dir_vec /= length
+            new_q = nearest_node.q + dir_vec * min(search_radius, length)
+
+            T = self.fk(new_q.tolist())
+            if not self.isPoseReachable(T):
+                continue
+
+            new_node = Node(new_q)
+            new_node.parent = nearest_node
+            new_node.cost = nearest_node.cost + length
+
+            near_inds = self._find_near_nodes(new_node, nodes, radius=search_radius)
+            if near_inds:
+                new_node = self._choose_parent(new_node, near_inds, nodes)
+                if new_node is None:
+                    continue
+                self._rewire(new_node, near_inds, nodes)
+
+            nodes.append(new_node)
+
+            if self._is_close_to_target(new_node.q, target_pose):
+                if new_node.cost < c_best:
+                    print(f"🆕 更新最优路径，cost={new_node.cost}")
+                    best_goal_node = new_node
+                    c_best = new_node.cost
+                    no_improvement = 0
+                else:
+                    no_improvement += 1
+            else:
+                no_improvement += 1
+
+            if no_improvement > MAX_NO_IMPROVEMENT:
+                print("🔚 多次无改进，提前终止")
+                break
+
+            if animation and i % 50 == 0:
+                self._draw_graph(nodes, target_pose, sampled_point=rnd)
+
+        if best_goal_node is None:
+            print("⚠️ 达到最大迭代次数仍未找到路径")
+            return None
+
+        path = []
+        node = best_goal_node
+        while node:
+            path.append(node.q.tolist())
+            node = node.parent
+        path.reverse()
+        return path, path[-1]
+
+    def _sample_in_ellipsoid(self, center, c_best, c_min, L, bounds):
+        dim = len(center)
+        while True:
+            r = np.random.randn(dim)
+            r /= np.linalg.norm(r)
+            r *= np.random.rand()
+            r *= c_best / 2
+            r += center
+            valid = all(bounds[i][0] <= r[i] <= bounds[i][1] for i in range(dim))
+            if valid:
+                return r.tolist()
+
+    def _halton_sequence(self, index: int, dim: int) -> np.ndarray:
+        """
+        生成第 index 个 Halton 序列点
+        :param index: 序列索引（从1开始）
+        :param dim: 维度
+        :return: Halton 序列点
+        """
+        primes = [2, 3, 5, 7, 11, 13][:dim]  # 使用前 dim 个质数作为基底
+        result = np.zeros(dim)
+
+        for i, prime in enumerate(primes):
+            d = index + 1  # Halton 通常从1开始计数
+            x = 0.0
+            inv_prime = 1.0 / prime
+            factor = 1.0
+
+            while d > 0:
+                factor *= inv_prime
+                d, remainder = divmod(d, prime)
+                x += remainder * factor
+
+            result[i] = x
+
+        return result
+
+
+    def _find_near_nodes(self, new_node, nodes, radius=0.5):
+        dist_list = [np.linalg.norm(n.q - new_node.q) for n in nodes]
+        return [i for i, d in enumerate(dist_list) if d <= radius]
+
+    def _choose_parent(self, new_node, near_inds, nodes):
+        costs = []
+        for i in near_inds:
+            if self._check_connectivity(nodes[i].q, new_node.q):
+                cost = nodes[i].cost + np.linalg.norm(new_node.q - nodes[i].q)
+                costs.append((cost, i))
+        if not costs:
+            return None
+        _, parent_idx = min(costs, key=lambda x: x[0])
+        new_node.parent = nodes[parent_idx]
+        new_node.cost = new_node.parent.cost + np.linalg.norm(new_node.q - new_node.parent.q)
+        return new_node
+
+    def _rewire(self, new_node, near_inds, nodes):
+        for i in near_inds:
+            if self._check_connectivity(new_node.q, nodes[i].q):
+                new_cost = new_node.cost + np.linalg.norm(nodes[i].q - new_node.q)
+                if new_cost < nodes[i].cost:
+                    nodes[i].parent = new_node
+                    nodes[i].cost = new_cost
+
+    def _is_close_to_target(self, q, target_pose, threshold=0.01):
+        T = self.fk(q)
+        pos_error = T[:3, 3] - target_pose[:3, 3]
+        orient_error = R.from_matrix(T[:3, :3]).as_rotvec() - R.from_matrix(target_pose[:3, :3]).as_rotvec()
+        return np.linalg.norm(pos_error) < threshold and np.linalg.norm(orient_error) < threshold
+
+    def _check_connectivity(self, q1, q2, steps=10):
+        key = (tuple(np.round(q1, 3)), tuple(np.round(q2, 3)))
+        if hasattr(self, '_connectivity_cache') and key in self._connectivity_cache:
+            return self._connectivity_cache[key]
+
+        for alpha in np.linspace(0, 1, steps):
+            q = (1 - alpha) * np.array(q1) + alpha * np.array(q2)
+            T = self.fk(q.tolist())
+            if not self.isPoseReachable(T):
+                self._connectivity_cache[key] = False
+                return False
+
+        self._connectivity_cache[key] = True
+        return True
+
+    def _draw_graph(self, nodes, target_pose, sampled_point=None):
+        plt.cla()
+        xs = [node.q[0] for node in nodes]
+        ys = [node.q[1] for node in nodes]
+        plt.plot(xs, ys, '.', markersize=2)
+
+        if sampled_point is not None:
+            plt.plot(sampled_point[0], sampled_point[1], 'go', label='Sampled Point')
+
+        plt.plot(target_pose[0, 3], target_pose[1, 3], "xr", label='Target')
+        plt.legend()
+        plt.axis("equal")
+        plt.grid(True)
+        plt.pause(0.01)
